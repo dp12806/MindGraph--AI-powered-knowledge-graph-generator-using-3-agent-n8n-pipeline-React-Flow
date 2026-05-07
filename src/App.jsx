@@ -13,7 +13,7 @@ import ExportPanel from "./components/ExportPanel";
 import { buildGraphElements } from "./utils/graphBuilder";
 
 const nodeTypes = { mindmap: MindMapNode };
-const N8N_WEBHOOK_URL = "https://padhiyar.app.n8n.cloud/webhook/generate-mindmap";
+const N8N_WEBHOOK_URL = "YOUR_WEBHOOK_URL";
 const SUPADATA_API_KEY = "YOUR_SUPADATA_API_KEY";
 
 const SOURCE_MODES = [

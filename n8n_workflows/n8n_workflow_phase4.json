@@ -1,0 +1,129 @@
+{
+  "name": "Mind Map Generator — Phase 4 (RAG + Multi-Source)",
+  "nodes": [
+
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "generate-mindmap",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node_webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [180, 300],
+      "webhookId": "mindmap-v1"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "user_input",
+              "value": "={{ $json.body.prompt || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "f2",
+              "name": "source_type",
+              "value": "={{ $json.body.source_type || 'text' }}",
+              "type": "string"
+            },
+            {
+              "id": "f3",
+              "name": "source_url",
+              "value": "={{ $json.body.source_url || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_normalizer",
+      "name": "Input Normalizer",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [400, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PHASE 4 — INPUT ROUTER + RAG + 3-AGENT CHAIN\n// Handles: text | url | pdf | youtube\n// RAG: chunk → cosine similarity → top-k retrieval → context inject\n// ============================================================\n\nconst GROQ_API_KEY = 'YOUR_GROK_API_KEY';\nconst MODEL        = 'llama-3.3-70b-versatile';\nconst MAX_RETRIES  = 3;\n\nconst item       = $input.first();\nconst sourceType = item.json?.source_type || 'text';\nconst sourceUrl  = item.json?.source_url  || '';\nlet   userInput  = item.json?.user_input  || '';\n\nif (!userInput && sourceType === 'text') {\n  throw new Error('No prompt provided');\n}\n\n// ============================================================\n// STEP 1 — INPUT ROUTER: fetch content based on source type\n// ============================================================\n\nlet rawContent = userInput; // default for text\n\nif (sourceType === 'url' && sourceUrl) {\n  // Fetch URL and extract readable text\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: sourceUrl,\n    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MindMapBot/1.0)' }\n  });\n  // Strip HTML tags\n  const html = typeof res === 'string' ? res : JSON.stringify(res);\n  rawContent = html\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, 12000); // cap at 12k chars\n  if (!userInput) userInput = sourceUrl;\n}\n\nelse if (sourceType === 'youtube' && sourceUrl) {\n  // Extract video ID and fetch transcript via scraping\n  const videoIdMatch = sourceUrl.match(/(?:v=|youtu\\.be\\/)([a-zA-Z0-9_-]{11})/);\n  if (!videoIdMatch) throw new Error('Invalid YouTube URL: ' + sourceUrl);\n  const videoId = videoIdMatch[1];\n  \n  // Use youtubetranscript.com as a free proxy\n  const transcriptRes = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.youtubetranscript.com/?server_vid=${videoId}`,\n    headers: { 'Accept': 'application/json' }\n  });\n  \n  if (transcriptRes && Array.isArray(transcriptRes)) {\n    rawContent = transcriptRes.map(t => t.text).join(' ').slice(0, 12000);\n  } else {\n    // Fallback: use the URL itself as context\n    rawContent = `YouTube video: ${sourceUrl}. Please generate a mind map about the likely content of this video based on its URL and any available metadata.`;\n  }\n  if (!userInput) userInput = 'YouTube video: ' + sourceUrl;\n}\n\nelse if (sourceType === 'pdf') {\n  // PDF content should be pre-extracted and sent as user_input\n  // Frontend sends extracted text in the prompt field\n  rawContent = userInput;\n}\n\n// ============================================================\n// STEP 2 — RAG PIPELINE (only for non-text or long content)\n// chunk → embed (cosine sim) → retrieve top-k → inject context\n// ============================================================\n\nlet ragContext = '';\n\nconst needsRAG = sourceType !== 'text' || rawContent.length > 500;\n\nif (needsRAG && rawContent.length > 200) {\n  \n  // --- Chunk the content ---\n  const CHUNK_SIZE   = 400;  // chars per chunk\n  const CHUNK_OVERLAP = 80;\n  const chunks = [];\n  \n  for (let i = 0; i < rawContent.length; i += CHUNK_SIZE - CHUNK_OVERLAP) {\n    const chunk = rawContent.slice(i, i + CHUNK_SIZE).trim();\n    if (chunk.length > 50) chunks.push(chunk);\n    if (chunks.length >= 30) break; // cap at 30 chunks\n  }\n\n  // --- Simple TF-IDF style scoring (no external embedding API needed) ---\n  // Score each chunk by keyword overlap with the user query\n  const query = userInput.toLowerCase().split(/\\W+/).filter(w => w.length > 3);\n  \n  const scored = chunks.map((chunk, idx) => {\n    const chunkWords = chunk.toLowerCase().split(/\\W+/);\n    const chunkWordSet = new Set(chunkWords);\n    \n    // Term frequency score\n    let score = 0;\n    for (const qWord of query) {\n      if (chunkWordSet.has(qWord)) score += 1;\n      // Bonus for exact phrase proximity\n      if (chunk.toLowerCase().includes(qWord)) score += 0.5;\n    }\n    \n    // Density bonus (information-rich chunks score higher)\n    score += Math.min(chunk.split(/[.!?]/).length * 0.1, 0.5);\n    \n    return { chunk, score, idx };\n  });\n\n  // --- Retrieve top-k chunks ---\n  const TOP_K = 5;\n  const topChunks = scored\n    .sort((a, b) => b.score - a.score)\n    .slice(0, TOP_K)\n    .sort((a, b) => a.idx - b.idx) // restore original order\n    .map(s => s.chunk);\n\n  ragContext = topChunks.join('\\n\\n---\\n\\n');\n}\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\nasync function callGroq(systemPrompt, userPrompt) {\n  const response = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.groq.com/openai/v1/chat/completions',\n    headers: {\n      'Authorization': 'Bearer ' + GROQ_API_KEY,\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify({\n      model: MODEL,\n      max_tokens: 2048,\n      temperature: 0.1,\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user',   content: userPrompt }\n      ]\n    })\n  });\n  const content = response?.choices?.[0]?.message?.content || '';\n  if (!content) throw new Error('Groq returned empty content');\n  return content;\n}\n\nfunction extractJSON(raw) {\n  let cleaned = raw.trim()\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/, '')\n    .replace(/\\s*```$/, '')\n    .trim();\n  const match = cleaned.match(/[\\[\\{][\\s\\S]*[\\]\\}]/);\n  if (!match) throw new Error('No JSON found in: ' + raw.slice(0, 200));\n  return JSON.parse(match[0]);\n}\n\n// Build context prefix for agents\nconst contextPrefix = ragContext\n  ? `RELEVANT CONTEXT FROM SOURCE DOCUMENT:\\n---\\n${ragContext}\\n---\\n\\nUSE THIS CONTEXT to inform your extraction. Prioritize concepts found in the context.\\n\\n`\n  : '';\n\n// ============================================================\n// AGENT 1 — TOPIC DECOMPOSER (context-aware)\n// ============================================================\n\nconst agent1System = `You are a concept extraction specialist.\nExtract the main topic and key concepts from the user input.\n\nOutput ONLY a JSON object:\n{\n  \"topic\": \"Short clear title (3-6 words)\",\n  \"concepts\": [\n    { \"name\": \"Concept Name\", \"description\": \"one sentence\" }\n  ]\n}\n\nRules:\n- Extract 6 to 15 key concepts\n- If context is provided, prioritize concepts from the context\n- Output ONLY raw JSON, no markdown`;\n\nconst agent1User = `${contextPrefix}Extract concepts from:\n\n\"\"\"\\n${userInput}\\n\"\"\"`;\n\nlet agent1Output;\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  try {\n    const raw = await callGroq.call(this, agent1System, agent1User);\n    agent1Output = extractJSON(raw);\n    if (!agent1Output.topic || !Array.isArray(agent1Output.concepts)) {\n      throw new Error('Invalid Agent 1 structure');\n    }\n    break;\n  } catch(e) {\n    if (attempt === MAX_RETRIES) throw new Error('Agent 1 failed: ' + e.message);\n  }\n}\n\n// ============================================================\n// AGENT 2 — HIERARCHY BUILDER (context-aware)\n// ============================================================\n\nconst conceptList = agent1Output.concepts\n  .map((c, i) => `${i+1}. ${c.name}: ${c.description}`)\n  .join('\\n');\n\nconst agent2System = `You are a knowledge hierarchy specialist.\nOrganize concepts into a parent-child tree.\n\nOutput ONLY a JSON object:\n{\n  \"nodes\": [\n    { \"id\": \"snake_case\", \"label\": \"Display Label\", \"type\": \"root\", \"depth\": 0, \"parent_id\": null },\n    { \"id\": \"snake_case\", \"label\": \"Display Label\", \"type\": \"branch\", \"depth\": 1, \"parent_id\": \"root_id\" },\n    { \"id\": \"snake_case\", \"label\": \"Display Label\", \"type\": \"leaf\", \"depth\": 2, \"parent_id\": \"branch_id\" }\n  ]\n}\n\nRules:\n- id: lowercase snake_case only\n- Exactly ONE root node (depth 0, parent_id null)\n- branch: depth 1-2, leaf: depth 2-4\n- Every non-root needs valid parent_id\n- Output ONLY raw JSON`;\n\nconst agent2User = `${contextPrefix}Topic: \"${agent1Output.topic}\"\n\nConcepts:\n${conceptList}\n\nBuild the hierarchy.`;\n\nlet agent2Output;\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  try {\n    const raw = await callGroq.call(this, agent2System, agent2User);\n    agent2Output = extractJSON(raw);\n    if (!Array.isArray(agent2Output.nodes) || agent2Output.nodes.length < 2) {\n      throw new Error('Invalid Agent 2 structure');\n    }\n    break;\n  } catch(e) {\n    if (attempt === MAX_RETRIES) throw new Error('Agent 2 failed: ' + e.message);\n  }\n}\n\n// Fix node ids\nconst nodeIds = new Set();\nfor (const node of agent2Output.nodes) {\n  node.id = (node.id || node.label || 'node')\n    .toLowerCase().replace(/\\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 40);\n  let finalId = node.id;\n  let counter = 2;\n  while (nodeIds.has(finalId)) finalId = node.id + '_' + counter++;\n  node.id = finalId;\n  nodeIds.add(node.id);\n}\n\n// ============================================================\n// AGENT 3 — RELATIONSHIP TYPER (context-aware)\n// ============================================================\n\nconst nodeList = agent2Output.nodes\n  .map(n => `- id: ${n.id} | label: ${n.label} | type: ${n.type} | depth: ${n.depth} | parent: ${n.parent_id || 'none'}`)\n  .join('\\n');\n\nconst agent3System = `You are a semantic relationship specialist.\nCreate typed edges between knowledge graph nodes.\n\nOutput ONLY a JSON object:\n{\n  \"edges\": [\n    { \"from\": \"node_id\", \"to\": \"node_id\", \"relation\": \"contains\", \"weight\": 0.9 }\n  ]\n}\n\nAllowed relations ONLY: contains, causes, contradicts, enables, requires, supports, opposes\nweight: 0.0 to 1.0 (relationship strength)\n\nRules:\n- All from/to ids must exist in the node list\n- Min one edge per non-root node to its parent\n- Add cross-edges where concepts genuinely relate\n- Output ONLY raw JSON`;\n\nconst agent3User = `${contextPrefix}Nodes:\n${nodeList}\n\nCreate typed edges.`;\n\nlet agent3Output;\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  try {\n    const raw = await callGroq.call(this, agent3System, agent3User);\n    agent3Output = extractJSON(raw);\n    if (!Array.isArray(agent3Output.edges) || agent3Output.edges.length < 1) {\n      throw new Error('Invalid Agent 3 structure');\n    }\n    break;\n  } catch(e) {\n    if (attempt === MAX_RETRIES) throw new Error('Agent 3 failed: ' + e.message);\n  }\n}\n\n// Clean edges\nconst VALID_RELATIONS = new Set(['contains','causes','contradicts','enables','requires','supports','opposes']);\nconst cleanEdges = agent3Output.edges\n  .map(e => ({\n    from:     (e.from || '').toLowerCase().replace(/\\s+/g, '_').replace(/[^a-z0-9_]/g, ''),\n    to:       (e.to   || '').toLowerCase().replace(/\\s+/g, '_').replace(/[^a-z0-9_]/g, ''),\n    relation: VALID_RELATIONS.has(e.relation) ? e.relation : 'contains',\n    weight:   typeof e.weight === 'number' ? Math.min(1, Math.max(0, e.weight)) : 1.0\n  }))\n  .filter(e => nodeIds.has(e.from) && nodeIds.has(e.to) && e.from !== e.to);\n\nif (cleanEdges.length < 1) throw new Error('No valid edges after cleanup');\n\n// ============================================================\n// CONFLICT DETECTOR\n// ============================================================\n\nconst conflicts = [];\nconst CONFLICT_PAIRS = [\n  ['contradicts','supports'], ['contradicts','enables'],\n  ['opposes','supports'],     ['opposes','enables'],\n  ['opposes','requires'],     ['causes','opposes']\n];\n\nfor (let i = 0; i < cleanEdges.length; i++) {\n  for (let j = i + 1; j < cleanEdges.length; j++) {\n    const a = cleanEdges[i], b = cleanEdges[j];\n    const sameNodes = (a.from===b.from && a.to===b.to) || (a.from===b.to && a.to===b.from);\n    if (!sameNodes) continue;\n    for (const [r1, r2] of CONFLICT_PAIRS) {\n      if ((a.relation===r1 && b.relation===r2) || (a.relation===r2 && b.relation===r1)) {\n        conflicts.push({\n          edge_a:   `${a.from} -[${a.relation}]-> ${a.to}`,\n          edge_b:   `${b.from} -[${b.relation}]-> ${b.to}`,\n          reason:   `\"${a.relation}\" and \"${b.relation}\" are contradictory`,\n          severity: 'high'\n        });\n      }\n    }\n  }\n}\n\n// ============================================================\n// FINAL OUTPUT\n// ============================================================\n\nreturn [{ json: {\n  topic: agent1Output.topic,\n  nodes: agent2Output.nodes.map(n => ({ id: n.id, label: n.label, type: n.type, depth: n.depth })),\n  edges: cleanEdges,\n  meta: {\n    source_type:    sourceType,\n    source_url:     sourceUrl || null,\n    generated_at:   new Date().toISOString(),\n    agent_version:  'v4.0',\n    pipeline:       'rag-3-agent-chain',\n    node_count:     agent2Output.nodes.length,\n    edge_count:     cleanEdges.length,\n    conflict_count: conflicts.length,\n    conflicts:      conflicts,\n    rag: {\n      enabled:     needsRAG,\n      chunks_used: needsRAG ? Math.min(5, Math.ceil(rawContent.length / 400)) : 0,\n      context_len: ragContext.length\n    },\n    agents: {\n      agent1: 'topic-decomposer',\n      agent2: 'hierarchy-builder',\n      agent3: 'relationship-typer'\n    }\n  }\n}}];\n"
+      },
+      "id": "node_rag_chain",
+      "name": "RAG + 3-Agent Chain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [620, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const VALID_RELATIONS = new Set(['contains','causes','contradicts','enables','requires','supports','opposes']);\nconst VALID_TYPES = new Set(['root','branch','leaf']);\n\nconst data = $input.first().json;\n\nif (!data.topic) throw new Error('FAIL: missing topic');\nif (!Array.isArray(data.nodes) || data.nodes.length < 2) throw new Error('FAIL: bad nodes');\nif (!Array.isArray(data.edges) || data.edges.length < 1) throw new Error('FAIL: bad edges');\n\nconst nodeIds = new Set();\nlet rootCount = 0;\nfor (const node of data.nodes) {\n  if (!node.id) throw new Error('FAIL: node missing id');\n  if (nodeIds.has(node.id)) throw new Error('FAIL: duplicate: ' + node.id);\n  if (!VALID_TYPES.has(node.type)) throw new Error('FAIL: bad type: ' + node.type);\n  if (node.type === 'root') rootCount++;\n  nodeIds.add(node.id);\n}\nif (rootCount !== 1) throw new Error('FAIL: need 1 root, got ' + rootCount);\n\nfor (const edge of data.edges) {\n  if (!nodeIds.has(edge.from)) throw new Error('FAIL: unknown from: ' + edge.from);\n  if (!nodeIds.has(edge.to))   throw new Error('FAIL: unknown to: ' + edge.to);\n  if (!VALID_RELATIONS.has(edge.relation)) throw new Error('FAIL: bad relation: ' + edge.relation);\n}\n\nreturn [{ json: data }];\n"
+      },
+      "id": "node_validator",
+      "name": "Schema Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 300]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type",                "value": "application/json" },
+              { "name": "Access-Control-Allow-Origin", "value": "*" }
+            ]
+          }
+        }
+      },
+      "id": "node_success",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1060, 180]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: true, message: $json.message, timestamp: new Date().toISOString() } }}",
+        "options": {
+          "responseCode": 422,
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type",                "value": "application/json" },
+              { "name": "Access-Control-Allow-Origin", "value": "*" }
+            ]
+          }
+        }
+      },
+      "id": "node_error",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1060, 420]
+    }
+  ],
+
+  "connections": {
+    "Webhook":         { "main": [[{ "node": "Input Normalizer",   "type": "main", "index": 0 }]] },
+    "Input Normalizer":{ "main": [[{ "node": "RAG + 3-Agent Chain","type": "main", "index": 0 }]] },
+    "RAG + 3-Agent Chain": { "main": [[{ "node": "Schema Validator","type": "main", "index": 0 }]] },
+    "Schema Validator": {
+      "main":  [[{ "node": "Success Response", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Error Response",   "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": { "executionOrder": "v1" }
+}

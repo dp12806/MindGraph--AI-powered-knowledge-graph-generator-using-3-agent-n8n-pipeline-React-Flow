@@ -30,12 +30,6 @@ It's the kind of system that's genuinely useful for learning, research, and know
 
 > 📹 **[Watch the full demo video](#)** — (https://youtu.be/DbseGRF2bpk)
 
-### Screenshots
-
-| Text Input | YouTube Input |
-|---|---|
-| ![Text demo](assets/text-demo.png) | ![YouTube demo](assets/youtube-demo.png) |
-
 **What you're looking at:**
 - Purple node = root concept
 - Teal nodes = branches (sub-domains)
